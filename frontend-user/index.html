@@ -19,22 +19,40 @@
         <section class="panel-section">
           <h2>音频上传</h2>
           <div class="upload-area" id="uploadArea">
-            <input type="file" id="audioInput" accept="audio/*" hidden>
+            <input type="file" id="audioInput" accept="audio/*,.mp3,.wav,.ogg,.oga,.m4a,.aac,.flac,.webm,.weba,.opus" multiple hidden>
+            <input type="file" id="replaceInput" accept="audio/*,.mp3,.wav,.ogg,.oga,.m4a,.aac,.flac,.webm,.weba,.opus" hidden>
             <div class="upload-placeholder">
               <span class="upload-icon">🎵</span>
               <p>点击或拖拽上传音频文件</p>
-              <p class="upload-hint">支持 MP3, WAV, OGG 等格式</p>
+              <p class="upload-hint">支持批量选择 / 拖入多个文件，格式 MP3, WAV, OGG, M4A, AAC, FLAC 等</p>
             </div>
           </div>
-          <div class="file-info" id="fileInfo" style="display: none;">
-            <span class="file-name" id="fileName"></span>
-            <button class="btn-remove" id="removeFile">✕</button>
+
+          <div class="queue-toolbar" id="queueToolbar" style="display: none;">
+            <span class="queue-count" id="queueCount">待分析 0 项</span>
+            <div class="queue-actions">
+              <button class="btn-link" id="downloadZipBtn" title="把整份清单打包下载留档">
+                <span>📦</span> 打包下载
+              </button>
+              <button class="btn-link btn-link-danger" id="clearQueueBtn" title="清空清单">
+                <span>🗑</span> 清空
+              </button>
+            </div>
+          </div>
+
+          <ul class="upload-list" id="uploadList"></ul>
+
+          <div class="queue-empty" id="queueEmpty">
+            <span class="empty-icon">📂</span>
+            <p>清单为空</p>
+            <p class="queue-empty-hint">点击上方区域或直接拖入多个音频文件，<br>即可形成待分析清单（刷新页面后仍保留）</p>
           </div>
         </section>
 
         <section class="panel-section">
           <h2>音频播放</h2>
           <div class="audio-player" id="audioPlayerSection" style="display: none;">
+            <div class="audio-player-name" id="audioPlayerName" title=""></div>
             <audio id="audioPlayer" controls></audio>
             <div class="duration-info">
               <span>总时长: <strong id="totalDuration">0.000</strong> 秒</span>
