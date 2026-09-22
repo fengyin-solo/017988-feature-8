@@ -2,23 +2,33 @@ import { AudioAnalyzer } from './modules/audioAnalyzer.js';
 import { ChartManager } from './modules/chartManager.js';
 import { UIController } from './modules/uiController.js';
 import { RecordManager } from './modules/recordManager.js';
+import { FileQueueManager } from './modules/fileQueueManager.js';
+import { createZip, reserveZipNames, downloadBlob } from './utils/zip.js';
 import { Logger } from './utils/logger.js';
 
 // 初始化日志
 const logger = new Logger('Main');
 
-// 应用初始化
+// 可识别的音频扩展名（type 不可靠时的兜底判断）
+const AUDIO_EXTENSIONS = new Set([
+  'mp3', 'wav', 'ogg', 'oga', 'm4a', 'mp4', 'aac',
+  'flac', 'webm', 'opus', 'wma', 'amr', '3gp', 'aiff', 'aif'
+]);
+
+/**
+ * 应用初始化
+ */
 class App {
   constructor() {
     this.audioAnalyzer = null;
     this.chartManager = null;
     this.uiController = null;
     this.recordManager = null;
-    this.audioBuffer = null;
+    this.queueManager = null;
     this.audioContext = null;
     this.currentAnalysisResult = null;
-    this.currentFileName = '';
-    this.selectedRecordId = null;
+    this.activeItemId = null;
+    this.replacingItemId = null;
   }
 
   async init() {
@@ -27,18 +37,25 @@ class App {
     try {
       // 初始化 AudioContext
       this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      
+
       // 初始化模块
       this.audioAnalyzer = new AudioAnalyzer(this.audioContext);
       this.chartManager = new ChartManager();
       this.uiController = new UIController();
       this.recordManager = new RecordManager();
+      this.queueManager = new FileQueueManager();
+
+      await this.queueManager.init();
 
       // 绑定事件
       this.bindEvents();
 
-      // 加载历史记录列表
+      // 渲染清单与历史记录
+      this.renderQueue();
       this.updateRecordsList();
+
+      // 恢复清单中文件的状态并载入首个文件
+      await this.restoreQueue();
 
       logger.info('应用初始化完成');
     } catch (error) {
@@ -48,12 +65,15 @@ class App {
   }
 
   bindEvents() {
-    // 文件上传
     const uploadArea = document.getElementById('uploadArea');
     const audioInput = document.getElementById('audioInput');
-    const removeFile = document.getElementById('removeFile');
+    const replaceInput = document.getElementById('replaceInput');
 
-    uploadArea.addEventListener('click', () => audioInput.click());
+    // 点击上传区域 → 批量选择
+    uploadArea.addEventListener('click', () => {
+      this.resumeAudioContext();
+      audioInput.click();
+    });
     uploadArea.addEventListener('dragover', (e) => {
       e.preventDefault();
       uploadArea.classList.add('dragover');
@@ -61,110 +81,551 @@ class App {
     uploadArea.addEventListener('dragleave', () => {
       uploadArea.classList.remove('dragover');
     });
-    uploadArea.addEventListener('drop', (e) => {
+    uploadArea.addEventListener('drop', async (e) => {
       e.preventDefault();
       uploadArea.classList.remove('dragover');
-      const file = e.dataTransfer.files[0];
-      if (file) this.handleFileUpload(file);
+      this.resumeAudioContext();
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length) await this.addFiles(files);
     });
 
-    audioInput.addEventListener('change', (e) => {
+    audioInput.addEventListener('change', async (e) => {
+      const files = Array.from(e.target.files);
+      e.target.value = '';
+      if (files.length) await this.addFiles(files);
+    });
+
+    replaceInput.addEventListener('change', async (e) => {
       const file = e.target.files[0];
-      if (file) this.handleFileUpload(file);
+      const itemId = this.replacingItemId;
+      e.target.value = '';
+      this.replacingItemId = null;
+      if (file && itemId) await this.replaceFile(itemId, file);
     });
 
-    removeFile.addEventListener('click', () => this.removeAudioFile());
+    // 清单操作（事件委托）
+    document.getElementById('clearQueueBtn')
+      .addEventListener('click', () => this.clearQueue());
+    document.getElementById('downloadQueueBtn')
+      .addEventListener('click', () => this.downloadQueue());
+
+    const fileQueue = document.getElementById('fileQueue');
+    fileQueue.addEventListener('click', (e) => this.handleQueueClick(e));
 
     // 区间选择
     const startTime = document.getElementById('startTime');
     const endTime = document.getElementById('endTime');
     startTime.addEventListener('input', () => this.updateRangeSlider());
     endTime.addEventListener('input', () => this.updateRangeSlider());
-
-    // 范围滑块拖拽
     this.initRangeSlider();
 
     // 分析按钮
-    const analyzeBtn = document.getElementById('analyzeBtn');
-    analyzeBtn.addEventListener('click', () => this.analyzeAudio());
+    document.getElementById('analyzeBtn')
+      .addEventListener('click', () => this.analyzeAudio());
 
     // 记录相关事件
     this.bindRecordEvents();
   }
 
-  async handleFileUpload(file) {
-    // 验证文件类型
-    if (!file.type.startsWith('audio/')) {
-      alert('请上传有效的音频文件');
+  resumeAudioContext() {
+    if (this.audioContext && this.audioContext.state === 'suspended') {
+      this.audioContext.resume().catch(() => {});
+    }
+  }
+
+  // ----------------------------------------------------------------
+  // 清单：添加 / 校验 / 解码
+  // ----------------------------------------------------------------
+
+  /**
+   * 批量添加文件（自动去重，避免重复堆积）
+   */
+  async addFiles(files) {
+    const added = [];
+    const skipped = [];
+    const invalid = [];
+
+    for (const file of files) {
+      if (this.queueManager.hasFile(file)) {
+        skipped.push(file.name);
+        continue;
+      }
+      if (this.wasAnalyzed(file)) {
+        skipped.push(file.name);
+        continue;
+      }
+      if (!this.isLikelyAudio(file)) {
+        invalid.push(`${file.name}：文件格式不支持（非音频文件）`);
+        continue;
+      }
+
+      const item = await this.queueManager.addFile(file);
+      added.push(item);
+    }
+
+    this.renderQueue();
+
+    if (added.length === 1 && !this.activeItemId) {
+      this.processItem(added[0].id, { activate: true });
+    } else {
+      added.forEach((item) => this.processItem(item.id));
+    }
+
+    // 汇总提示
+    if (added.length) {
+      this.uiController.showToast(`已添加 ${added.length} 个文件到待分析清单`, 'success');
+    }
+    if (skipped.length) {
+      this.uiController.showToast(
+        `跳过 ${skipped.length} 个已在清单或已分析过的文件：${skipped.slice(0, 3).join('、')}${skipped.length > 3 ? ' 等' : ''}`,
+        'warning'
+      );
+    }
+    if (invalid.length) {
+      invalid.slice(0, 3).forEach((reason) =>
+        this.uiController.showToast(reason, 'error'));
+    }
+  }
+
+  /**
+   * 根据 MIME / 扩展名判断是否为音频文件
+   */
+  isLikelyAudio(file) {
+    if (file.type && file.type.startsWith('audio/')) return true;
+    // blob 拖拽等场景 type 可能为空，用扩展名兜底
+    const ext = file.name.includes('.')
+      ? file.name.slice(file.name.lastIndexOf('.') + 1).toLowerCase()
+      : '';
+    return AUDIO_EXTENSIONS.has(ext);
+  }
+
+  /**
+   * 该文件是否已经分析过（与历史记录比对）
+   */
+  wasAnalyzed(file) {
+    return this.recordManager.getAllRecords().some((record) => {
+      if (record.fileName !== file.name) return false;
+      // 旧记录没有文件大小信息，仅按文件名判定
+      if (record.fileSize == null) return true;
+      return record.fileSize === file.size;
+    });
+  }
+
+  /**
+   * 读取并解码清单条目
+   * @param {string} itemId
+   * @param {{activate?: boolean, force?: boolean}} options
+   *        force 为 true 时即使是"不支持格式"也尝试重新解码（重试场景）
+   */
+  async processItem(itemId, options = {}) {
+    const item = this.queueManager.getItem(itemId);
+    if (!item) return;
+
+    const { activate = false, force = false } = options;
+
+    if (!this.isLikelyAudio({ name: item.name, type: item.type }) && !force) {
+      this.queueManager.update(itemId, {
+        status: 'error',
+        errorReason: '文件格式不支持（非音频文件）'
+      });
+      this.renderQueue();
       return;
     }
 
-    this.currentFileName = file.name;
-    logger.info('开始加载音频文件', { name: file.name, size: file.size });
+    this.queueManager.update(itemId, {
+      status: 'reading',
+      errorReason: ''
+    });
+    this.renderQueue();
 
     try {
-      // 显示加载状态
-      this.uiController.showLoading('正在加载音频...');
+      const blob = item.blob || (await this.queueManager.getBlob(itemId));
+      if (!blob) throw new Error('文件数据丢失，无法读取');
 
-      // 读取文件
-      const arrayBuffer = await file.arrayBuffer();
-      
-      // 解码音频
-      this.audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
+      const arrayBuffer = await blob.arrayBuffer();
+      const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer.slice(0));
 
-      // 更新 UI
-      const duration = this.audioBuffer.duration;
-      const durationMs = Math.floor(duration * 1000);
+      this.queueManager.update(itemId, {
+        status: 'ready',
+        duration: audioBuffer.duration,
+        errorReason: ''
+      });
+      this.renderQueue();
 
-      document.getElementById('fileName').textContent = file.name;
-      document.getElementById('fileInfo').style.display = 'flex';
-      document.getElementById('uploadArea').style.display = 'none';
-
-      // 设置音频播放器
-      const audioPlayer = document.getElementById('audioPlayer');
-      audioPlayer.src = URL.createObjectURL(file);
-      document.getElementById('audioPlayerSection').style.display = 'block';
-      document.getElementById('totalDuration').textContent = duration.toFixed(3);
-
-      // 设置区间选择
-      document.getElementById('startTime').value = 0;
-      document.getElementById('startTime').max = durationMs;
-      document.getElementById('endTime').value = durationMs;
-      document.getElementById('endTime').max = durationMs;
-
-      this.updateRangeSlider();
-
-      // 启用分析按钮
-      document.getElementById('analyzeBtn').disabled = false;
-
-      logger.info('音频文件加载成功', { duration, sampleRate: this.audioBuffer.sampleRate });
+      if (activate || (!this.activeItemId && this.getActiveItem() == null)) {
+        this.activateItem(itemId);
+      }
     } catch (error) {
-      logger.error('音频文件加载失败', error);
-      alert('音频文件加载失败，请确保文件格式正确');
+      const reason = this.describeDecodeError(error, item.name);
+      logger.warn('音频读取失败', { name: item.name, reason });
+      this.queueManager.update(itemId, {
+        status: 'error',
+        errorReason: reason
+      });
+      this.renderQueue();
+    }
+  }
+
+  /**
+   * 给出逐条可读的失败原因
+   */
+  describeDecodeError(error, fileName) {
+    const message = (error && error.message) || '';
+    if (/encodingError|Unable to decode|解码/i.test(message)) {
+      return '文件已损坏或编码格式不受浏览器支持，读取失败';
+    }
+    if (fileName && !this.isLikelyAudio({ name: fileName, type: '' })) {
+      return '文件格式不支持（非音频文件）';
+    }
+    return '音频读取失败，请确认文件未损坏后重试';
+  }
+
+  // ----------------------------------------------------------------
+  // 清单：渲染与交互
+  // ----------------------------------------------------------------
+
+  renderQueue() {
+    const items = this.queueManager.getItems();
+    const listEl = document.getElementById('fileQueue');
+    const emptyEl = document.getElementById('queueEmpty');
+    const clearBtn = document.getElementById('clearQueueBtn');
+    const downloadBtn = document.getElementById('downloadQueueBtn');
+
+    const readyCount = items.filter((i) => i.status === 'ready').length;
+    const analyzedCount = items.filter((i) => i.analyzedAt).length;
+    const errorCount = items.filter((i) => i.status === 'error').length;
+
+    document.getElementById('queueSummary').innerHTML = items.length
+      ? `共 <strong>${items.length}</strong> 项` +
+        (readyCount ? ` · 可分析 <strong>${readyCount}</strong>` : '') +
+        (analyzedCount ? ` · 已分析 <strong>${analyzedCount}</strong>` : '') +
+        (errorCount ? ` · <strong class="queue-summary-error">失败 ${errorCount}</strong>` : '')
+      : '';
+
+    clearBtn.disabled = items.length === 0;
+    downloadBtn.disabled = items.length === 0;
+
+    if (items.length === 0) {
+      listEl.style.display = 'none';
+      listEl.innerHTML = '';
+      emptyEl.style.display = 'flex';
+      this.updateAnalyzeButton();
+      return;
+    }
+
+    emptyEl.style.display = 'none';
+    listEl.style.display = 'flex';
+    listEl.innerHTML = items.map((item) => this.renderQueueItem(item)).join('');
+    this.updateAnalyzeButton();
+  }
+
+  renderQueueItem(item) {
+    const isActive = item.id === this.activeItemId;
+    const formatTag = this.escapeHtml((item.ext || '未知').toUpperCase());
+
+    const actionButtons = `
+      <button class="item-btn item-replace" data-action="replace" title="替换此文件">⇄ 替换</button>
+      <button class="item-btn item-remove" data-action="remove" title="移除此文件">✕</button>
+    `;
+
+    if (item.status === 'reading') {
+      return `
+        <li class="queue-item reading${isActive ? ' active' : ''}" data-id="${item.id}">
+          <div class="item-top">
+            <span class="item-icon">⏳</span>
+            <span class="item-name">${this.escapeHtml(item.name)}</span>
+            <div class="item-actions">
+              <button class="item-btn item-remove" data-action="remove" title="移除此文件">✕</button>
+            </div>
+          </div>
+          <div class="item-meta">
+            <span class="item-reading-text">正在读取…</span>
+          </div>
+        </li>
+      `;
+    }
+
+    if (item.status === 'error') {
+      return `
+        <li class="queue-item error${isActive ? ' active' : ''}" data-id="${item.id}">
+          <div class="item-top">
+            <span class="item-icon">⚠️</span>
+            <span class="item-name">${this.escapeHtml(item.name)}</span>
+            <div class="item-actions">
+              <button class="item-btn item-retry" data-action="retry" title="重新读取">↻ 重试</button>
+              <button class="item-btn item-remove" data-action="remove" title="移除此文件">✕</button>
+            </div>
+          </div>
+          <div class="item-meta item-error-reason" title="${this.escapeHtml(item.errorReason)}">
+            ${this.escapeHtml(item.errorReason || '读取失败')}
+          </div>
+        </li>
+      `;
+    }
+
+    return `
+      <li class="queue-item ready${isActive ? ' active' : ''}" data-id="${item.id}">
+        <div class="item-top">
+          <span class="item-icon">🎵</span>
+          <span class="item-name">${this.escapeHtml(item.name)}</span>
+          <div class="item-actions">${actionButtons}</div>
+        </div>
+        <div class="item-meta">
+          <span class="item-tag item-format">${formatTag}</span>
+          <span class="item-tag item-duration">⏱ ${this.formatDuration(item.duration)}</span>
+          <span class="item-tag item-size">${this.formatSize(item.size)}</span>
+          ${item.analyzedAt ? '<span class="item-tag item-analyzed">✓ 已分析</span>' : ''}
+        </div>
+      </li>
+    `;
+  }
+
+  async handleQueueClick(event) {
+    const actionEl = event.target.closest('[data-action]');
+    const row = event.target.closest('.queue-item');
+    if (!row) return;
+    const itemId = row.dataset.id;
+    const item = this.queueManager.getItem(itemId);
+    if (!item) return;
+
+    if (actionEl) {
+      event.stopPropagation();
+      const action = actionEl.dataset.action;
+      if (action === 'remove') {
+        await this.removeItem(itemId);
+      } else if (action === 'replace') {
+        this.replacingItemId = itemId;
+        this.resumeAudioContext();
+        document.getElementById('replaceInput').click();
+      } else if (action === 'retry') {
+        await this.processItem(itemId, { force: true, activate: item.status === 'error' && itemId === this.activeItemId });
+      }
+      return;
+    }
+
+    // 点击条目主体：设为当前分析文件
+    if (item.status === 'ready') {
+      this.activateItem(itemId);
+    } else if (item.status === 'error') {
+      this.uiController.showToast(`${item.name}：${item.errorReason}`, 'warning');
+    }
+  }
+
+  async removeItem(itemId) {
+    await this.queueManager.remove(itemId);
+    if (this.activeItemId === itemId) {
+      this.activeItemId = null;
+      this.resetWorkspace();
+    }
+    this.renderQueue();
+    // 自动选中下一个可分析文件
+    if (!this.activeItemId) {
+      const next = this.queueManager.getItems().find((i) => i.status === 'ready');
+      if (next) this.activateItem(next.id);
+    }
+    this.uiController.showToast('文件已从清单移除', 'info');
+  }
+
+  async replaceFile(itemId, file) {
+    // 去重（排除自身）
+    const duplicate = this.queueManager.getItems().some(
+      (i) => i.id !== itemId && i.name === file.name && i.size === file.size
+    );
+    if (duplicate || this.wasAnalyzed(file)) {
+      this.uiController.showToast('该文件已在清单中或已分析过，无需重复添加', 'warning');
+      return;
+    }
+    if (!this.isLikelyAudio(file)) {
+      this.uiController.showToast(`${file.name}：文件格式不支持（非音频文件）`, 'error');
+      return;
+    }
+
+    await this.queueManager.replaceFile(itemId, file);
+    this.renderQueue();
+    await this.processItem(itemId, { force: true, activate: itemId === this.activeItemId });
+  }
+
+  async clearQueue() {
+    if (this.queueManager.getItems().length === 0) return;
+    if (!confirm('确定清空整份待分析清单吗？此操作不可恢复。')) return;
+    await this.queueManager.clear();
+    this.activeItemId = null;
+    this.resetWorkspace();
+    this.renderQueue();
+    this.uiController.showToast('清单已清空', 'info');
+  }
+
+  /**
+   * 将整份清单（音频文件 + manifest）打包为 ZIP 下载留档
+   */
+  async downloadQueue() {
+    const items = this.queueManager.getItems();
+    if (items.length === 0) return;
+
+    try {
+      this.uiController.showLoading('正在打包清单…');
+      const entries = await this.queueManager.getEntriesWithBlobs();
+
+      if (entries.length === 0) {
+        this.uiController.showToast('没有可下载的文件数据', 'error');
+        return;
+      }
+
+      const manifest = {
+        exportedAt: new Date().toISOString(),
+        totalFiles: entries.length,
+        files: items.map((item) => ({
+          name: item.name,
+          format: (item.ext || '').toUpperCase() || '未知',
+          sizeBytes: item.size,
+          durationSeconds: item.duration,
+          status: item.status === 'ready'
+            ? 'ready'
+            : item.status === 'error'
+              ? `error: ${item.errorReason}`
+              : 'reading',
+          analyzed: !!item.analyzedAt
+        }))
+      };
+      const manifestBlob = new Blob([JSON.stringify(manifest, null, 2)], {
+        type: 'application/json'
+      });
+
+      const zipEntries = reserveZipNames(entries, ['manifest.json']);
+      zipEntries.unshift({ name: 'manifest.json', zipName: 'manifest.json', blob: manifestBlob });
+
+      const zipBlob = await createZip(zipEntries);
+      const stamp = this.recordManager.formatTimestamp().replace(/[: ]/g, '-');
+      downloadBlob(zipBlob, `待分析清单-${stamp}.zip`);
+      this.uiController.showToast(`已打包 ${entries.length} 个文件`, 'success');
+    } catch (error) {
+      logger.error('打包下载失败', error);
+      this.uiController.showToast('打包下载失败：' + error.message, 'error');
     } finally {
       this.uiController.hideLoading();
     }
   }
 
-  removeAudioFile() {
-    this.audioBuffer = null;
+  // ----------------------------------------------------------------
+  // 当前活动文件与工作区
+  // ----------------------------------------------------------------
+
+  getActiveItem() {
+    return this.activeItemId
+      ? this.queueManager.getItem(this.activeItemId)
+      : null;
+  }
+
+  async activateItem(itemId) {
+    const item = this.queueManager.getItem(itemId);
+    if (!item || item.status !== 'ready') return;
+
+    try {
+      const blob = item.blob || (await this.queueManager.getBlob(itemId));
+      if (!blob) throw new Error('文件数据丢失');
+
+      this.activeItemId = itemId;
+      const arrayBuffer = await blob.arrayBuffer();
+      const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer.slice(0));
+
+      this.loadAudioBuffer(item, audioBuffer, blob);
+      this.renderQueue();
+    } catch (error) {
+      logger.error('载入文件失败', error);
+      this.uiController.showToast(`${item.name} 载入失败`, 'error');
+    }
+  }
+
+  /**
+   * 将解码后的音频载入播放、区间与分析工作区
+   */
+  loadAudioBuffer(item, audioBuffer, blob) {
+    const durationMs = Math.floor(audioBuffer.duration * 1000);
+
+    // 播放器
+    const audioPlayer = document.getElementById('audioPlayer');
+    if (audioPlayer.src) URL.revokeObjectURL(audioPlayer.src);
+    audioPlayer.src = URL.createObjectURL(blob);
+    document.getElementById('audioPlayerSection').style.display = 'block';
+    document.getElementById('totalDuration').textContent = audioBuffer.duration.toFixed(3);
+
+    // 区间选择
+    document.getElementById('startTime').value = 0;
+    document.getElementById('startTime').max = durationMs;
+    document.getElementById('endTime').value = durationMs;
+    document.getElementById('endTime').max = durationMs;
+    this.updateRangeSlider();
+
+    // 重置上一文件的分析结果
+    this.audioBuffer = audioBuffer;
     this.currentAnalysisResult = null;
-    this.currentFileName = '';
-    document.getElementById('audioInput').value = '';
-    document.getElementById('fileInfo').style.display = 'none';
-    document.getElementById('uploadArea').style.display = 'block';
-    document.getElementById('audioPlayerSection').style.display = 'none';
-    document.getElementById('analyzeBtn').disabled = true;
     document.getElementById('chartContainer').style.display = 'none';
     document.getElementById('emptyState').style.display = 'flex';
     document.getElementById('fundamentalInfo').style.display = 'none';
     document.getElementById('saveRecordSection').style.display = 'none';
-    
-    // 清除图表
     this.chartManager.clearAllCharts();
 
-    logger.info('音频文件已移除');
+    this.updateAnalyzeButton();
   }
+
+  resetWorkspace() {
+    this.audioBuffer = null;
+    this.currentAnalysisResult = null;
+
+    const audioPlayer = document.getElementById('audioPlayer');
+    if (audioPlayer.src) {
+      URL.revokeObjectURL(audioPlayer.src);
+      audioPlayer.removeAttribute('src');
+      audioPlayer.load();
+    }
+    document.getElementById('audioPlayerSection').style.display = 'none';
+    document.getElementById('chartContainer').style.display = 'none';
+    document.getElementById('emptyState').style.display = 'flex';
+    document.getElementById('fundamentalInfo').style.display = 'none';
+    document.getElementById('saveRecordSection').style.display = 'none';
+
+    document.getElementById('startTime').value = 0;
+    document.getElementById('endTime').value = 0;
+    this.updateAnalyzeButton();
+    this.chartManager.clearAllCharts();
+  }
+
+  updateAnalyzeButton() {
+    const item = this.getActiveItem();
+    document.getElementById('analyzeBtn').disabled = !(item && item.status === 'ready');
+  }
+
+  /**
+   * 页面重新打开后恢复清单：读取文件状态并载入首个可分析文件
+   */
+  async restoreQueue() {
+    const items = this.queueManager.getItems();
+    let firstReady = null;
+
+    for (const item of items) {
+      if (item.status === 'ready' || item.status === 'reading' || item.status === 'error') {
+        if (!firstReady && item.status === 'ready') firstReady = item;
+        // ready/reading 的文件重新验证解码（持久化的时长信息仅作展示缓存）
+        if (item.status !== 'error') {
+          await this.processItem(item.id);
+          const refreshed = this.queueManager.getItem(item.id);
+          if (!firstReady && refreshed && refreshed.status === 'ready') {
+            firstReady = refreshed;
+          }
+        }
+      }
+    }
+
+    if (firstReady) {
+      await this.activateItem(firstReady.id);
+    } else {
+      this.updateAnalyzeButton();
+    }
+  }
+
+  // ----------------------------------------------------------------
+  // 区间选择滑块
+  // ----------------------------------------------------------------
 
   initRangeSlider() {
     const track = document.getElementById('rangeTrack');
@@ -214,7 +675,6 @@ class App {
 
     // 确保起始时间不大于结束时间
     if (startTime > endTime) {
-      // 交换值
       const temp = startTime;
       startTime = endTime;
       endTime = temp;
@@ -222,7 +682,6 @@ class App {
       document.getElementById('endTime').value = endTime;
     }
 
-    // 确保值在有效范围内
     startTime = Math.max(0, Math.min(startTime, maxTime));
     endTime = Math.max(0, Math.min(endTime, maxTime));
 
@@ -238,9 +697,14 @@ class App {
     document.getElementById('selectedDuration').textContent = durationSec.toFixed(3);
   }
 
+  // ----------------------------------------------------------------
+  // 分析
+  // ----------------------------------------------------------------
+
   async analyzeAudio() {
-    if (!this.audioBuffer) {
-      alert('请先上传音频文件');
+    const item = this.getActiveItem();
+    if (!item || item.status !== 'ready' || !this.audioBuffer) {
+      this.uiController.showToast('请先从清单中选择一个可分析的音频文件', 'warning');
       return;
     }
 
@@ -252,49 +716,44 @@ class App {
       return;
     }
 
-    logger.info('开始分析音频', { startMs, endMs });
+    logger.info('开始分析音频', { file: item.name, startMs, endMs });
 
     try {
       this.uiController.showLoading('正在分析音频...');
-
-      // 获取 FFT 大小
       const fftSize = parseInt(document.getElementById('fftSize').value);
 
-      // 提取选定区间的音频数据
       const startSample = Math.floor((startMs / 1000) * this.audioBuffer.sampleRate);
       const endSample = Math.floor((endMs / 1000) * this.audioBuffer.sampleRate);
       const channelData = this.audioBuffer.getChannelData(0);
       const selectedData = channelData.slice(startSample, endSample);
 
-      // 分析音频
-      const analysisResult = await this.audioAnalyzer.analyze(selectedData, this.audioBuffer.sampleRate, fftSize);
+      const analysisResult = await this.audioAnalyzer.analyze(
+        selectedData, this.audioBuffer.sampleRate, fftSize
+      );
 
-      logger.info('音频分析完成', { 
+      logger.info('音频分析完成', {
+        file: item.name,
         fundamentalFreq: analysisResult.fundamentalFreq,
-        harmonicsCount: analysisResult.harmonics.length 
+        harmonicsCount: analysisResult.harmonics.length
       });
 
-      // 保存当前分析结果
       this.currentAnalysisResult = analysisResult;
 
-      // 更新图表
       this.chartManager.updateAllCharts(analysisResult, selectedData, this.audioBuffer.sampleRate);
-
-      // 更新基频信息
       this.updateFundamentalInfo(analysisResult);
 
-      // 显示图表区域
       document.getElementById('chartContainer').style.display = 'flex';
       document.getElementById('emptyState').style.display = 'none';
-
-      // 显示保存记录区域
       document.getElementById('saveRecordSection').style.display = 'block';
-      document.getElementById('recordName').value = `${this.currentFileName} - ${this.recordManager.formatTimestamp()}`;
+      document.getElementById('recordName').value = `${item.name} - ${this.recordManager.formatTimestamp()}`;
       document.getElementById('recordNote').value = '';
 
+      // 标记该文件已分析（用于去重与清单徽标）
+      this.queueManager.update(item.id, { analyzedAt: Date.now() });
+      this.renderQueue();
     } catch (error) {
       logger.error('音频分析失败', error);
-      alert('音频分析失败: ' + error.message);
+      this.uiController.showToast('音频分析失败: ' + error.message, 'error');
     } finally {
       this.uiController.hideLoading();
     }
@@ -313,25 +772,20 @@ class App {
     `).join('');
   }
 
+  // ----------------------------------------------------------------
+  // 历史记录
+  // ----------------------------------------------------------------
+
   bindRecordEvents() {
-    // 保存记录按钮
     document.getElementById('saveRecordBtn').addEventListener('click', () => this.saveRecord());
-
-    // 展开/收起记录列表
     document.getElementById('toggleRecordsBtn').addEventListener('click', () => this.toggleRecordsPanel());
-
-    // 关闭模态框
     document.getElementById('closeModalBtn').addEventListener('click', () => this.closeRecordModal());
     document.getElementById('recordDetailModal').addEventListener('click', (e) => {
       if (e.target.id === 'recordDetailModal') {
         this.closeRecordModal();
       }
     });
-
-    // 应用记录
     document.getElementById('applyRecordBtn').addEventListener('click', () => this.applyRecord());
-
-    // 删除记录
     document.getElementById('deleteRecordBtn').addEventListener('click', () => this.deleteRecord());
   }
 
@@ -341,6 +795,7 @@ class App {
       return;
     }
 
+    const item = this.getActiveItem();
     const name = document.getElementById('recordName').value.trim();
     const note = document.getElementById('recordNote').value.trim();
     const startMs = parseInt(document.getElementById('startTime').value) || 0;
@@ -350,14 +805,15 @@ class App {
 
     try {
       const record = this.recordManager.createRecord({
-        fileName: this.currentFileName,
+        fileName: item ? item.name : '未知文件',
+        fileSize: item ? item.size : null,
         startMs,
         endMs,
         fundamentalFreq: this.currentAnalysisResult.fundamentalFreq,
         harmonics: this.currentAnalysisResult.harmonics,
         harmonicIntensities,
         analysisResult: this.currentAnalysisResult,
-        name: name
+        name
       });
 
       if (note) {
@@ -394,7 +850,7 @@ class App {
 
     const maxMag = Math.max(...Object.values(intensities));
     const normalizedIntensities = {};
-    Object.keys(intensities).forEach(key => {
+    Object.keys(intensities).forEach((key) => {
       normalizedIntensities[key] = maxMag > 0 ? (intensities[key] / maxMag) * 100 : 0;
     });
 
@@ -415,23 +871,22 @@ class App {
     recordsList.style.display = 'block';
     recordsEmpty.style.display = 'none';
 
-    recordsList.innerHTML = records.map(record => `
+    recordsList.innerHTML = records.map((record) => `
       <div class="record-item" data-id="${record.id}">
         <div class="record-main">
-          <span class="record-name" title="${record.name}">${this.truncateText(record.name, 25)}</span>
+          <span class="record-name" title="${this.escapeHtml(record.name)}">${this.escapeHtml(this.truncateText(record.name, 25))}</span>
           <span class="record-freq">${record.fundamentalFreq.toFixed(1)} Hz</span>
         </div>
         <div class="record-meta">
-          <span class="record-file" title="${record.fileName}">${this.truncateText(record.fileName, 20)}</span>
+          <span class="record-file" title="${this.escapeHtml(record.fileName)}">${this.escapeHtml(this.truncateText(record.fileName, 20))}</span>
           <span class="record-time">${this.recordManager.formatDate(record.createdAt)}</span>
         </div>
       </div>
     `).join('');
 
-    recordsList.querySelectorAll('.record-item').forEach(item => {
-      item.addEventListener('click', () => {
-        const id = item.dataset.id;
-        this.showRecordDetail(id);
+    recordsList.querySelectorAll('.record-item').forEach((itemEl) => {
+      itemEl.addEventListener('click', () => {
+        this.showRecordDetail(itemEl.dataset.id);
       });
     });
   }
@@ -444,7 +899,7 @@ class App {
   toggleRecordsPanel() {
     const content = document.getElementById('recordsContent');
     const btn = document.getElementById('toggleRecordsBtn');
-    
+
     if (content.style.display === 'none') {
       content.style.display = 'block';
       btn.textContent = '▼';
@@ -470,7 +925,7 @@ class App {
           <div class="detail-grid">
             <div class="detail-item">
               <span class="detail-label">文件名</span>
-              <span class="detail-value">${record.fileName}</span>
+              <span class="detail-value">${this.escapeHtml(record.fileName)}</span>
             </div>
             <div class="detail-item">
               <span class="detail-label">创建时间</span>
@@ -486,7 +941,7 @@ class App {
             </div>
           </div>
         </div>
-        
+
         <div class="detail-section">
           <h4>倍频与强度</h4>
           <div class="harmonics-table">
@@ -523,11 +978,11 @@ class App {
             }).join('')}
           </div>
         </div>
-        
+
         ${record.note ? `
           <div class="detail-section">
             <h4>备注</h4>
-            <p class="record-note">${record.note}</p>
+            <p class="record-note">${this.escapeHtml(record.note)}</p>
           </div>
         ` : ''}
       </div>
@@ -579,6 +1034,37 @@ class App {
         this.uiController.showToast('删除失败', 'error');
       }
     }
+  }
+
+  // ----------------------------------------------------------------
+  // 格式化工具
+  // ----------------------------------------------------------------
+
+  escapeHtml(text) {
+    return String(text == null ? '' : text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  /**
+   * 时长格式化：短于 1 分钟显示 x.xxx 秒，否则 m:ss.xxx
+   */
+  formatDuration(seconds) {
+    if (seconds == null || !Number.isFinite(seconds)) return '--';
+    if (seconds < 60) return `${seconds.toFixed(3)} 秒`;
+    const mins = Math.floor(seconds / 60);
+    const rest = seconds - mins * 60;
+    return `${mins}:${rest.toFixed(3).padStart(6, '0')}`;
+  }
+
+  formatSize(bytes) {
+    if (bytes == null) return '';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
   }
 }
 

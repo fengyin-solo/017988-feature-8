@@ -19,16 +19,32 @@
         <section class="panel-section">
           <h2>音频上传</h2>
           <div class="upload-area" id="uploadArea">
-            <input type="file" id="audioInput" accept="audio/*" hidden>
+            <input type="file" id="audioInput" accept="audio/*,.mp3,.wav,.ogg,.m4a,.flac,.aac,.webm" multiple hidden>
             <div class="upload-placeholder">
               <span class="upload-icon">🎵</span>
-              <p>点击或拖拽上传音频文件</p>
-              <p class="upload-hint">支持 MP3, WAV, OGG 等格式</p>
+              <p>点击或拖入多个音频文件</p>
+              <p class="upload-hint">支持 MP3、WAV、OGG、M4A、FLAC 等格式，可批量添加</p>
             </div>
           </div>
-          <div class="file-info" id="fileInfo" style="display: none;">
-            <span class="file-name" id="fileName"></span>
-            <button class="btn-remove" id="removeFile">✕</button>
+
+          <div class="queue-toolbar">
+            <span class="queue-summary" id="queueSummary"></span>
+            <div class="queue-toolbar-actions">
+              <button class="btn-queue" id="downloadQueueBtn" title="将整份待分析清单打包为 ZIP 留档" disabled>
+                📦 打包下载
+              </button>
+              <button class="btn-queue btn-queue-danger" id="clearQueueBtn" title="清空清单" disabled>
+                🗑 清空
+              </button>
+            </div>
+          </div>
+
+          <ul class="file-queue" id="fileQueue" style="display: none;"></ul>
+
+          <div class="queue-empty" id="queueEmpty">
+            <span class="empty-icon">📂</span>
+            <p>清单为空</p>
+            <p class="queue-empty-hint">点击上方区域或直接拖入音频文件，<br>可一次选择多个文件形成待分析清单</p>
           </div>
         </section>
 
@@ -228,6 +244,8 @@
       <p>© 2024 古琴音频分析软件 - 专为斫琴师设计</p>
     </footer>
   </div>
+
+  <input type="file" id="replaceInput" accept="audio/*,.mp3,.wav,.ogg,.m4a,.flac,.aac,.webm" hidden>
 
   <div class="loading-overlay" id="loadingOverlay" style="display: none;">
     <div class="loading-spinner"></div>

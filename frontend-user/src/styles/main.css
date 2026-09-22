@@ -168,6 +168,233 @@ body {
   background: rgba(244, 67, 54, 0.1);
 }
 
+/* 清单工具栏 */
+.queue-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.queue-summary {
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex: 1;
+  min-width: 0;
+}
+
+.queue-summary strong {
+  color: var(--primary-color);
+}
+
+.queue-summary-error {
+  color: var(--error-color) !important;
+}
+
+.queue-toolbar-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.btn-queue {
+  padding: 5px 10px;
+  font-size: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: #FFFAF0;
+  color: var(--primary-dark);
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.btn-queue:hover:not(:disabled) {
+  background: #FFF8DC;
+  border-color: var(--primary-color);
+}
+
+.btn-queue:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-queue-danger:hover:not(:disabled) {
+  background: #FDECEA;
+  border-color: var(--error-color);
+  color: var(--error-color);
+}
+
+/* 待分析文件清单 */
+.file-queue {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  max-height: 340px;
+  overflow-y: auto;
+}
+
+.queue-item {
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-color);
+  background: #FFFAF0;
+  transition: all 0.2s;
+}
+
+.queue-item.ready {
+  cursor: pointer;
+}
+
+.queue-item.ready:hover {
+  background: #FFF8DC;
+  transform: translateX(2px);
+}
+
+.queue-item.active {
+  border-color: var(--primary-color);
+  background: #FFF3DC;
+  box-shadow: 0 0 0 2px rgba(139, 69, 19, 0.15);
+}
+
+.queue-item.error {
+  border-color: rgba(244, 67, 54, 0.5);
+  background: #FFF5F5;
+}
+
+.queue-item.reading {
+  border-style: dashed;
+  background: #FAFAFA;
+}
+
+.item-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.item-icon {
+  font-size: 15px;
+  flex-shrink: 0;
+}
+
+.item-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.item-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.queue-item:hover .item-actions,
+.queue-item.active .item-actions,
+.queue-item.error .item-actions {
+  opacity: 1;
+}
+
+.item-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--surface-color);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.item-btn:hover {
+  border-color: var(--primary-color);
+  color: var(--primary-color);
+}
+
+.item-remove:hover,
+.item-retry:hover {
+  border-color: var(--error-color);
+  color: var(--error-color);
+}
+
+.item-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+  padding-left: 23px;
+}
+
+.item-tag {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: rgba(139, 69, 19, 0.08);
+  color: var(--text-secondary);
+}
+
+.item-format {
+  font-weight: 600;
+  color: var(--primary-color);
+  background: rgba(139, 69, 19, 0.12);
+}
+
+.item-analyzed {
+  color: var(--success-color);
+  background: rgba(76, 175, 80, 0.12);
+  font-weight: 600;
+}
+
+.item-reading-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.item-error-reason {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--error-color);
+}
+
+/* 清单空态 */
+.queue-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 18px 12px;
+  color: var(--text-secondary);
+}
+
+.queue-empty .empty-icon {
+  font-size: 28px;
+  margin-bottom: 6px;
+}
+
+.queue-empty p {
+  font-size: 13px;
+}
+
+.queue-empty-hint {
+  font-size: 11px !important;
+  opacity: 0.75;
+  margin-top: 4px;
+}
+
 /* 音频播放器 */
 .audio-player audio {
   width: 100%;

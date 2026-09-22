@@ -47,6 +47,7 @@ export class RecordManager {
    * 创建新记录
    * @param {Object} recordData - 记录数据
    * @param {string} recordData.fileName - 文件名
+   * @param {number} [recordData.fileSize] - 文件大小（字节，用于去重）
    * @param {number} recordData.startMs - 起始时间 (ms)
    * @param {number} recordData.endMs - 结束时间 (ms)
    * @param {number} recordData.fundamentalFreq - 基频
@@ -61,6 +62,7 @@ export class RecordManager {
       id: this.generateId(),
       name: recordData.name || `${recordData.fileName} - ${this.formatTimestamp()}`,
       fileName: recordData.fileName,
+      fileSize: typeof recordData.fileSize === 'number' ? recordData.fileSize : null,
       startMs: recordData.startMs,
       endMs: recordData.endMs,
       durationMs: recordData.endMs - recordData.startMs,
